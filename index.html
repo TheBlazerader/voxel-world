@@ -22,6 +22,16 @@
         display: block;
     }
 
+    #underwater-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 9;
+        pointer-events: none;
+        display: none;
+        background: rgba(20, 95, 190, 0.34);
+        box-shadow: inset 0 0 100px rgba(0, 55, 135, 0.28);
+    }
+
     #hud {
         position: fixed;
         inset: 0;
@@ -344,6 +354,8 @@
 
 <body>
 
+<div id="underwater-overlay" aria-hidden="true"></div>
+
 <div id="hud">
     <div id="title">VOXEL WORLD</div>
 
@@ -459,6 +471,9 @@ const WALK_SPEED = 5.0;
 const SPRINT_SPEED = 8.5;
 const JUMP_SPEED = 8.0;
 const GRAVITY = 22.0;
+const WATER_GRAVITY = 4.5;
+const WATER_MAX_FALL_SPEED = 2.4;
+const WATER_SWIM_UP_SPEED = 3.2;
 
 const REACH_DISTANCE = 4;
 
@@ -1594,6 +1609,49 @@ function remotePlayerIntersectsBlock(x, y, z) {
 // MOVEMENT
 // =====================================================
 
+// Returns the highest water surface intersecting the player's body, or null
+// when the player is not in water. Sample the center and four body corners.
+function getPlayerWaterSurface() {
+    const height = getPlayerHeight();
+    const feetY = player.y - height;
+    const minBlockY = Math.floor(feetY);
+    const maxBlockY = Math.floor(player.y);
+    const inset = PLAYER_RADIUS * 0.8;
+    const samplePoints = [
+        [player.x, player.z],
+        [player.x - inset, player.z - inset],
+        [player.x + inset, player.z - inset],
+        [player.x - inset, player.z + inset],
+        [player.x + inset, player.z + inset]
+    ];
+    let highestSurface = null;
+
+    for (const [sampleX, sampleZ] of samplePoints) {
+        const blockX = Math.floor(sampleX);
+        const blockZ = Math.floor(sampleZ);
+        for (let blockY = minBlockY; blockY <= maxBlockY; blockY++) {
+            if (getBlock(blockX, blockY, blockZ) === BLOCK_WATER) {
+                const surface = blockY + 1;
+                if (highestSurface === null || surface > highestSurface) {
+                    highestSurface = surface;
+                }
+            }
+        }
+    }
+
+    return highestSurface;
+}
+
+function updateUnderwaterOverlay() {
+    const cameraBlock = getBlock(
+        Math.floor(camera.position.x),
+        Math.floor(camera.position.y),
+        Math.floor(camera.position.z)
+    );
+    const overlay = document.getElementById("underwater-overlay");
+    if (overlay) overlay.style.display = cameraBlock === BLOCK_WATER ? "block" : "none";
+}
+
 function hasCrouchSupport(px, pz) {
     const footY = player.y - CROUCH_HEIGHT;
     const supportY = Math.floor(footY - 0.06);
@@ -1669,7 +1727,24 @@ function movePlayer(delta) {
         }
     }
 
-    velocityY -= GRAVITY * delta;
+    const waterSurface = getPlayerWaterSurface();
+    const inWater = waterSurface !== null;
+
+    if (inWater) {
+        // Water greatly reduces falling speed. Holding SPACE swims upward
+        // until the player's feet reach the top surface of the water.
+        velocityY -= WATER_GRAVITY * delta;
+        velocityY = Math.max(velocityY, -WATER_MAX_FALL_SPEED);
+
+        const feetY = player.y - getPlayerHeight();
+        if (keys["Space"] && feetY < waterSurface - 0.015) {
+            velocityY = WATER_SWIM_UP_SPEED;
+        } else if (feetY >= waterSurface - 0.015 && velocityY > 0) {
+            velocityY = 0;
+        }
+    } else {
+        velocityY -= GRAVITY * delta;
+    }
 
     const nextY = player.y + velocityY * delta;
 
@@ -2412,6 +2487,7 @@ function animate() {
     }
 
     updateRemotePlayers(delta);
+    updateUnderwaterOverlay();
 
     if (performance.now() - lastMessageTime > 2200) {
         document.getElementById("message").textContent = "";
@@ -2440,5 +2516,4 @@ window.addEventListener("resize", () => {
 </script>
 </body>
 </html>
-
 
