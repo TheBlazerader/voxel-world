@@ -1316,7 +1316,7 @@ const pigHeadMaterial = new THREE.MeshStandardMaterial({ color: 0xf0aaaa, roughn
 const pigSnoutMaterial = new THREE.MeshStandardMaterial({ color: 0xd87983, roughness: 0.9 });
 const pigLegMaterial = new THREE.MeshStandardMaterial({ color: 0xb96e73, roughness: 1.0 });
 const pigEyeMaterial = new THREE.MeshStandardMaterial({ color: 0x241919, roughness: 0.7 });
-const pigHealthCanvasSize = { width: 256, height: 64 };
+const pigFlashMaterial = new THREE.MeshStandardMaterial({ color: 0xff3030, roughness: 0.9 });
 
 function pigCanStandAt(x, z) {
     if (!isInsideWorld(Math.floor(x), Math.floor(z))) return false;
@@ -1339,35 +1339,6 @@ function pigCanStandAt(x, z) {
     return true;
 }
 
-function drawPigHealth(pig) {
-    const ctx = pig.healthCanvas.getContext("2d");
-    ctx.clearRect(0, 0, pigHealthCanvasSize.width, pigHealthCanvasSize.height);
-    ctx.fillStyle = "rgba(0,0,0,0.48)";
-    ctx.fillRect(4, 4, 248, 56);
-    ctx.font = "42px Arial";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    for (let i = 0; i < 5; i++) {
-        const points = pig.health - i * 2;
-        const x = 28 + i * 50;
-        ctx.fillStyle = "#555555";
-        ctx.fillText("♥", x, 33);
-        if (points >= 2) {
-            ctx.fillStyle = "#ef3340";
-            ctx.fillText("♥", x, 33);
-        } else if (points >= 1) {
-            ctx.save();
-            ctx.beginPath();
-            ctx.rect(x - 22, 8, 22, 50);
-            ctx.clip();
-            ctx.fillStyle = "#ef3340";
-            ctx.fillText("♥", x, 33);
-            ctx.restore();
-        }
-    }
-    pig.healthTexture.needsUpdate = true;
-}
-
 function createPigEntity(id, x, z, groundY) {
     const group = new THREE.Group();
     const parts = [];
@@ -1382,7 +1353,7 @@ function createPigEntity(id, x, z, groundY) {
         return mesh;
     }
 
-    addPart(new THREE.BoxGeometry(0.95, 0.62, 0.62), pigBodyMaterial, 0, 0.72, 0.02);
+    addPart(new THREE.BoxGeometry(0.62, 0.62, 0.95), pigBodyMaterial, 0, 0.72, 0.02);
     addPart(new THREE.BoxGeometry(0.55, 0.55, 0.52), pigHeadMaterial, 0, 1.08, -0.48);
     addPart(new THREE.BoxGeometry(0.34, 0.24, 0.16), pigSnoutMaterial, 0, 0.99, -0.79);
     addPart(new THREE.BoxGeometry(0.18, 0.25, 0.12), pigHeadMaterial, -0.18, 1.43, -0.48).rotation.z = -0.25;
@@ -1391,36 +1362,23 @@ function createPigEntity(id, x, z, groundY) {
     addPart(new THREE.BoxGeometry(0.07, 0.07, 0.035), pigEyeMaterial, 0.19, 1.16, -0.75);
 
     const legs = [];
-    for (const lx of [-0.29, 0.29]) {
-        for (const lz of [-0.20, 0.24]) {
+    for (const lx of [-0.20, 0.20]) {
+        for (const lz of [-0.29, 0.29]) {
             const leg = addPart(new THREE.BoxGeometry(0.19, 0.42, 0.19), pigLegMaterial, lx, 0.22, lz);
             legs.push(leg);
         }
     }
-
-    const healthCanvas = document.createElement("canvas");
-    healthCanvas.width = pigHealthCanvasSize.width;
-    healthCanvas.height = pigHealthCanvasSize.height;
-    const healthTexture = new THREE.CanvasTexture(healthCanvas);
-    const healthLabel = new THREE.Mesh(
-        new THREE.PlaneGeometry(1.65, 0.42),
-        new THREE.MeshBasicMaterial({ map: healthTexture, transparent: true, depthWrite: false, side: THREE.DoubleSide })
-    );
-    healthLabel.position.y = 1.9;
-    healthLabel.visible = false;
-    group.add(healthLabel);
 
     group.position.set(x + 0.5, groundY + 1, z + 0.5);
     scene.add(group);
     const pig = {
         id, group, legs, health: PIG_MAX_HEALTH,
         targetX: x + 0.5, targetZ: z + 0.5,
-        targetTimer: 0, fleeUntil: 0,
+        targetTimer: 1 + Math.random() * 2, movingToGoal: false, path: null, pathIndex: 0, fleeUntil: 0,
         walkPhase: Math.random() * Math.PI * 2,
-        healthCanvas, healthTexture, healthLabel
+        parts, originalMaterials: parts.map(part => part.material), flashUntil: 0
     };
     pigs.set(id, pig);
-    drawPigHealth(pig);
     return pig;
 }
 
@@ -1434,7 +1392,6 @@ function spawnPigs() {
                 child.material.dispose();
             }
         });
-        pig.healthTexture.dispose();
     }
     pigs.clear();
 
@@ -1465,6 +1422,45 @@ function spawnPigs() {
     }
 }
 
+function findPigPath(startX, startZ, goalX, goalZ) {
+    const start = { x: Math.floor(startX), z: Math.floor(startZ) };
+    const goal = { x: Math.floor(goalX), z: Math.floor(goalZ) };
+    const key = (x, z) => `${x},${z}`;
+    const startKey = key(start.x, start.z);
+    const goalKey = key(goal.x, goal.z);
+    const queue = [start];
+    const cameFrom = new Map([[startKey, null]]);
+    const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    let found = startKey === goalKey;
+
+    for (let head = 0; head < queue.length && !found && queue.length < 900; head++) {
+        const current = queue[head];
+        for (const [ox, oz] of directions) {
+            const nx = current.x + ox;
+            const nz = current.z + oz;
+            const nextKey = key(nx, nz);
+            if (cameFrom.has(nextKey) || !pigCanStandAt(nx + 0.5, nz + 0.5)) continue;
+            cameFrom.set(nextKey, key(current.x, current.z));
+            if (nextKey === goalKey) {
+                found = true;
+                break;
+            }
+            queue.push({ x: nx, z: nz });
+        }
+    }
+    if (!found) return null;
+
+    const path = [];
+    let cursor = goalKey;
+    while (cursor && cursor !== startKey) {
+        const [x, z] = cursor.split(',').map(Number);
+        path.push({ x: x + 0.5, z: z + 0.5 });
+        cursor = cameFrom.get(cursor);
+    }
+    path.reverse();
+    return path;
+}
+
 function applyPigHit(pigId, nextHealth, makeFlee = true, attackerId = null) {
     const pig = pigs.get(pigId);
     if (!pig || !Number.isFinite(nextHealth)) return;
@@ -1473,18 +1469,15 @@ function applyPigHit(pigId, nextHealth, makeFlee = true, attackerId = null) {
         scene.remove(pig.group);
         pig.group.traverse(child => {
             if (child.geometry) child.geometry.dispose();
-            if (child.material && child.material !== pigBodyMaterial && child.material !== pigHeadMaterial &&
-                child.material !== pigSnoutMaterial && child.material !== pigLegMaterial && child.material !== pigEyeMaterial) {
-                child.material.dispose();
-            }
         });
-        pig.healthTexture.dispose();
         pigs.delete(pigId);
         showMessage("Pig defeated");
         return;
     }
-    drawPigHealth(pig);
-    pig.healthLabel.visible = true;
+
+    pig.flashUntil = performance.now() + 220;
+    for (const part of pig.parts) part.material = pigFlashMaterial;
+
     if (makeFlee) {
         pig.fleeUntil = performance.now() + 2800;
         const attacker = attackerId && attackerId !== multiplayerPlayerId
@@ -1495,52 +1488,67 @@ function applyPigHit(pigId, nextHealth, makeFlee = true, attackerId = null) {
         const dx = pig.group.position.x - attackerX;
         const dz = pig.group.position.z - attackerZ;
         const length = Math.hypot(dx, dz) || 1;
-        pig.targetX = pig.group.position.x + (dx / length) * 6;
-        pig.targetZ = pig.group.position.z + (dz / length) * 6;
-        pig.targetTimer = 2.8;
+        const fleeDistance = 10 + Math.random() * 5;
+        const fleeX = pig.group.position.x + (dx / length) * fleeDistance;
+        const fleeZ = pig.group.position.z + (dz / length) * fleeDistance;
+        const fleePath = findPigPath(pig.group.position.x, pig.group.position.z, fleeX, fleeZ);
+        if (fleePath && fleePath.length) {
+            pig.path = fleePath;
+            pig.pathIndex = 0;
+            pig.targetX = fleePath[0].x;
+            pig.targetZ = fleePath[0].z;
+            pig.movingToGoal = true;
+        } else {
+            pig.movingToGoal = false;
+            pig.targetTimer = 0.15;
+        }
     }
 }
 
 function choosePigWanderTarget(pig) {
-    for (let attempt = 0; attempt < 14; attempt++) {
+    // Choose a distant destination and use a grid path around water and solid obstacles.
+    for (let attempt = 0; attempt < 24; attempt++) {
         const angle = Math.random() * Math.PI * 2;
-        const distance = 3 + Math.random() * 6;
+        const distance = 8 + Math.random() * 9;
         const x = pig.group.position.x + Math.cos(angle) * distance;
         const z = pig.group.position.z + Math.sin(angle) * distance;
         if (!pigCanStandAt(x, z)) continue;
-        const steps = 5;
-        let clearPath = true;
-        for (let i = 1; i <= steps; i++) {
-            const t = i / steps;
-            if (!pigCanStandAt(THREE.MathUtils.lerp(pig.group.position.x, x, t),
-                THREE.MathUtils.lerp(pig.group.position.z, z, t))) {
-                clearPath = false;
-                break;
-            }
-        }
-        if (clearPath) {
-            pig.targetX = x;
-            pig.targetZ = z;
-            pig.targetTimer = 2 + Math.random() * 3;
-            return;
-        }
+        const path = findPigPath(pig.group.position.x, pig.group.position.z, x, z);
+        if (!path || path.length < 3) continue;
+        pig.path = path;
+        pig.pathIndex = 0;
+        pig.targetX = path[0].x;
+        pig.targetZ = path[0].z;
+        pig.movingToGoal = true;
+        return true;
     }
-    pig.targetTimer = 0.6;
+    pig.movingToGoal = false;
+    pig.targetTimer = 1 + Math.random() * 1.5;
+    return false;
 }
 
 function updatePigs(delta) {
     const now = performance.now();
     for (const pig of pigs.values()) {
-        pig.targetTimer -= delta;
-        if (pig.targetTimer <= 0) choosePigWanderTarget(pig);
+        if (pig.flashUntil && now >= pig.flashUntil) {
+            for (let i = 0; i < pig.parts.length; i++) {
+                pig.parts[i].material = pig.originalMaterials[i];
+            }
+            pig.flashUntil = 0;
+        }
+
+        const fleeing = now < pig.fleeUntil;
+        if (!pig.movingToGoal) {
+            pig.targetTimer -= delta;
+            if (pig.targetTimer <= 0) choosePigWanderTarget(pig);
+        }
 
         const dx = pig.targetX - pig.group.position.x;
         const dz = pig.targetZ - pig.group.position.z;
         const distance = Math.hypot(dx, dz);
-        const fleeing = now < pig.fleeUntil;
-        const speed = fleeing ? 1.55 : 0.82;
+        const speed = fleeing ? 1.75 : 0.72;
 
-        if (distance > 0.12) {
+        if (pig.movingToGoal && distance > 0.18) {
             const step = Math.min(distance, speed * delta);
             const nextX = pig.group.position.x + (dx / distance) * step;
             const nextZ = pig.group.position.z + (dz / distance) * step;
@@ -1549,20 +1557,32 @@ function updatePigs(delta) {
                 pig.group.position.z = nextZ;
                 const groundY = terrainHeight(Math.floor(nextX), Math.floor(nextZ));
                 pig.group.position.y = THREE.MathUtils.lerp(pig.group.position.y, groundY + 1, Math.min(1, delta * 8));
-                pig.group.rotation.y = Math.atan2(-dx, -dz);
-                pig.walkPhase += delta * (fleeing ? 10 : 5);
+                const desiredYaw = Math.atan2(-dx, -dz);
+                let yawDifference = desiredYaw - pig.group.rotation.y;
+                while (yawDifference > Math.PI) yawDifference -= Math.PI * 2;
+                while (yawDifference < -Math.PI) yawDifference += Math.PI * 2;
+                pig.group.rotation.y += yawDifference * Math.min(1, delta * 7);
+                pig.walkPhase += delta * (fleeing ? 10 : 4.5);
                 for (let i = 0; i < pig.legs.length; i++) {
-                    pig.legs[i].rotation.x = Math.sin(pig.walkPhase + (i % 2) * Math.PI) * (distance > 0.12 ? 0.42 : 0);
+                    pig.legs[i].rotation.x = Math.sin(pig.walkPhase + (i % 2) * Math.PI) * 0.42;
                 }
             } else {
-                pig.targetTimer = 0;
+                pig.movingToGoal = false;
+                pig.targetTimer = 0.5 + Math.random();
+            }
+        } else if (pig.movingToGoal) {
+            pig.pathIndex = (pig.pathIndex || 0) + 1;
+            if (pig.path && pig.pathIndex < pig.path.length) {
+                pig.targetX = pig.path[pig.pathIndex].x;
+                pig.targetZ = pig.path[pig.pathIndex].z;
+            } else {
+                pig.movingToGoal = false;
+                pig.path = null;
+                pig.targetTimer = fleeing ? 0.1 : 2.5 + Math.random() * 3.5;
+                for (const leg of pig.legs) leg.rotation.x = 0;
             }
         } else {
             for (const leg of pig.legs) leg.rotation.x *= 0.8;
-        }
-
-        if (pig.healthLabel.visible) {
-            pig.healthLabel.lookAt(camera.position);
         }
     }
 }
