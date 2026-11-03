@@ -410,7 +410,7 @@
             <strong>CONTROLS</strong><br>
             WASD: Move &nbsp; | &nbsp; Mouse / Arrow Keys: Look<br>
             Hold SPACE: Auto-jump &nbsp; | &nbsp; SHIFT: Sprint &nbsp; | &nbsp; C: Crouch<br>
-            Left Click / N: Punch player or break block &nbsp; | &nbsp; Right Click / M: Place<br>
+            Left Click / N: Punch player or pig, or break block &nbsp; | &nbsp; Right Click / M: Place<br>
             1–9: Select Hotbar Slot &nbsp; | &nbsp; P / ESC: Pause / Resume
         </div>
         <p style="font-size:12px">
@@ -519,6 +519,10 @@ const MULTIPLAYER_SERVER_URL = "wss://voxelworld3d.onrender.com/ws";
 const remotePlayers = new Map();
 const pendingRemoteStates = new Map();
 const REMOTE_INTERPOLATION = 0.18;
+const PIG_COUNT = 14;
+const PIG_MAX_HEALTH = 10;
+const PIG_PUNCH_DAMAGE = 1;
+const pigs = new Map();
 
 function multiplayerStatus(message) {
     const element = document.getElementById("multiplayer-status");
@@ -603,6 +607,13 @@ function handleMultiplayerMessage(message) {
         if (Number.isInteger(message.seed)) {
             randomSeed = message.seed;
             generateWorld();
+            if (Array.isArray(message.pigHealth)) {
+                for (const entry of message.pigHealth) {
+                    if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1])) {
+                        applyPigHit(entry[0], entry[1], false);
+                    }
+                }
+            }
             if (message.spawn && Number.isFinite(message.spawn.x) && Number.isFinite(message.spawn.z)) {
                 player.x = message.spawn.x;
                 player.z = message.spawn.z;
@@ -633,6 +644,8 @@ function handleMultiplayerMessage(message) {
     } else if (message.type === "player_punched") {
         const remote = remotePlayers.get(message.targetId);
         if (remote) remote.hitFlashUntil = performance.now() + 300;
+    } else if (message.type === "pig_hit") {
+        applyPigHit(message.pigId, message.health, true, message.attackerId);
     } else if (message.type === "player_state") {
         if (message.player && message.player.id !== multiplayerPlayerId) {
             addOrUpdateRemotePlayer(message.player);
@@ -651,6 +664,13 @@ function handleMultiplayerMessage(message) {
             if (Number.isInteger(message.seed)) randomSeed = message.seed;
             generateWorld();
             for (const edit of message.edits) if (isValidRemoteEdit(edit)) setBlock(edit.x, edit.y, edit.z, edit.block);
+            if (Array.isArray(message.pigHealth)) {
+                for (const entry of message.pigHealth) {
+                    if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1])) {
+                        applyPigHit(entry[0], entry[1], false);
+                    }
+                }
+            }
             rebuildWorldMeshes();
         }
     } else if (message.type === "health_update") {
@@ -907,11 +927,42 @@ function findLookedAtRemotePlayer() {
     return targetId;
 }
 
-function punchPlayer() {
-    if (!gameStarted || pauseState !== "playing" || !multiplayerReady) return false;
+function findLookedAtPig() {
+    if (pigs.size === 0) return null;
 
-    const targetId = findLookedAtRemotePlayer();
-    if (!targetId) return false;
+    camera.updateMatrixWorld(true);
+    scene.updateMatrixWorld(true);
+    remotePlayerRaycaster.setFromCamera(remotePlayerAimPoint, camera);
+    remotePlayerRaycaster.near = 0;
+    remotePlayerRaycaster.far = PUNCH_REACH;
+
+    const targetMeshes = [];
+    for (const pig of pigs.values()) {
+        if (pig.health <= 0) continue;
+        pig.group.traverse(child => {
+            if (child.isMesh && child.userData.pigId === pig.id) targetMeshes.push(child);
+        });
+    }
+
+    if (targetMeshes.length === 0) return null;
+    const intersections = remotePlayerRaycaster.intersectObjects(targetMeshes, false);
+    if (intersections.length === 0) return null;
+
+    const nearestHit = intersections[0];
+    const pigId = nearestHit.object.userData.pigId;
+    if (!pigId) return null;
+
+    const blockTarget = getTargetBlock();
+    if (blockTarget && blockTarget.distance + 0.05 < nearestHit.distance) return null;
+    return pigId;
+}
+
+function punchPlayer() {
+    if (!gameStarted || pauseState !== "playing") return false;
+
+    const targetId = multiplayerReady ? findLookedAtRemotePlayer() : null;
+    const pigId = targetId ? null : findLookedAtPig();
+    if (!targetId && !pigId) return false;
 
     const now = performance.now();
     if (now - lastPunchAt < PUNCH_COOLDOWN_MS) {
@@ -920,7 +971,21 @@ function punchPlayer() {
     }
 
     lastPunchAt = now;
-    multiplayerSend({ type: "punch", targetId, yaw });
+    if (targetId) {
+        multiplayerSend({ type: "punch", targetId, yaw });
+    } else {
+        const pig = pigs.get(pigId);
+        if (multiplayerReady) {
+            multiplayerSend({
+                type: "pig_punch",
+                pigId,
+                yaw,
+                position: pig ? { x: pig.group.position.x, y: pig.group.position.y, z: pig.group.position.z } : null
+            });
+        } else if (pig) {
+            applyPigHit(pigId, Math.max(0, pig.health - PIG_PUNCH_DAMAGE), true);
+        }
+    }
     showMessage("Punch!");
     return true;
 }
@@ -1239,6 +1304,267 @@ function generateWorld() {
     }
 
     camera.position.set(player.x, player.y, player.z);
+    spawnPigs();
+}
+
+// =====================================================
+// PIG ENTITIES
+// =====================================================
+
+const pigBodyMaterial = new THREE.MeshStandardMaterial({ color: 0xe99a9a, roughness: 0.9 });
+const pigHeadMaterial = new THREE.MeshStandardMaterial({ color: 0xf0aaaa, roughness: 0.9 });
+const pigSnoutMaterial = new THREE.MeshStandardMaterial({ color: 0xd87983, roughness: 0.9 });
+const pigLegMaterial = new THREE.MeshStandardMaterial({ color: 0xb96e73, roughness: 1.0 });
+const pigEyeMaterial = new THREE.MeshStandardMaterial({ color: 0x241919, roughness: 0.7 });
+const pigHealthCanvasSize = { width: 256, height: 64 };
+
+function pigCanStandAt(x, z) {
+    if (!isInsideWorld(Math.floor(x), Math.floor(z))) return false;
+    const cellX = Math.floor(x);
+    const cellZ = Math.floor(z);
+    const groundY = terrainHeight(cellX, cellZ);
+    if (groundY <= WATER_LEVEL) return false;
+    if (!isSolid(getBlock(cellX, groundY, cellZ))) return false;
+
+    for (const offsetX of [-0.35, 0, 0.35]) {
+        for (const offsetZ of [-0.28, 0, 0.28]) {
+            const checkX = Math.floor(x + offsetX);
+            const checkZ = Math.floor(z + offsetZ);
+            for (let y = groundY + 1; y <= groundY + 2; y++) {
+                const type = getBlock(checkX, y, checkZ);
+                if (type === BLOCK_WATER || isSolid(type)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+function drawPigHealth(pig) {
+    const ctx = pig.healthCanvas.getContext("2d");
+    ctx.clearRect(0, 0, pigHealthCanvasSize.width, pigHealthCanvasSize.height);
+    ctx.fillStyle = "rgba(0,0,0,0.48)";
+    ctx.fillRect(4, 4, 248, 56);
+    ctx.font = "42px Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i < 5; i++) {
+        const points = pig.health - i * 2;
+        const x = 28 + i * 50;
+        ctx.fillStyle = "#555555";
+        ctx.fillText("♥", x, 33);
+        if (points >= 2) {
+            ctx.fillStyle = "#ef3340";
+            ctx.fillText("♥", x, 33);
+        } else if (points >= 1) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(x - 22, 8, 22, 50);
+            ctx.clip();
+            ctx.fillStyle = "#ef3340";
+            ctx.fillText("♥", x, 33);
+            ctx.restore();
+        }
+    }
+    pig.healthTexture.needsUpdate = true;
+}
+
+function createPigEntity(id, x, z, groundY) {
+    const group = new THREE.Group();
+    const parts = [];
+    function addPart(geometry, material, px, py, pz) {
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.set(px, py, pz);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.userData.pigId = id;
+        group.add(mesh);
+        parts.push(mesh);
+        return mesh;
+    }
+
+    addPart(new THREE.BoxGeometry(0.95, 0.62, 0.62), pigBodyMaterial, 0, 0.72, 0.02);
+    addPart(new THREE.BoxGeometry(0.55, 0.55, 0.52), pigHeadMaterial, 0, 1.08, -0.48);
+    addPart(new THREE.BoxGeometry(0.34, 0.24, 0.16), pigSnoutMaterial, 0, 0.99, -0.79);
+    addPart(new THREE.BoxGeometry(0.18, 0.25, 0.12), pigHeadMaterial, -0.18, 1.43, -0.48).rotation.z = -0.25;
+    addPart(new THREE.BoxGeometry(0.18, 0.25, 0.12), pigHeadMaterial, 0.18, 1.43, -0.48).rotation.z = 0.25;
+    addPart(new THREE.BoxGeometry(0.07, 0.07, 0.035), pigEyeMaterial, -0.19, 1.16, -0.75);
+    addPart(new THREE.BoxGeometry(0.07, 0.07, 0.035), pigEyeMaterial, 0.19, 1.16, -0.75);
+
+    const legs = [];
+    for (const lx of [-0.29, 0.29]) {
+        for (const lz of [-0.20, 0.24]) {
+            const leg = addPart(new THREE.BoxGeometry(0.19, 0.42, 0.19), pigLegMaterial, lx, 0.22, lz);
+            legs.push(leg);
+        }
+    }
+
+    const healthCanvas = document.createElement("canvas");
+    healthCanvas.width = pigHealthCanvasSize.width;
+    healthCanvas.height = pigHealthCanvasSize.height;
+    const healthTexture = new THREE.CanvasTexture(healthCanvas);
+    const healthLabel = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.65, 0.42),
+        new THREE.MeshBasicMaterial({ map: healthTexture, transparent: true, depthWrite: false, side: THREE.DoubleSide })
+    );
+    healthLabel.position.y = 1.9;
+    healthLabel.visible = false;
+    group.add(healthLabel);
+
+    group.position.set(x + 0.5, groundY + 1, z + 0.5);
+    scene.add(group);
+    const pig = {
+        id, group, legs, health: PIG_MAX_HEALTH,
+        targetX: x + 0.5, targetZ: z + 0.5,
+        targetTimer: 0, fleeUntil: 0,
+        walkPhase: Math.random() * Math.PI * 2,
+        healthCanvas, healthTexture, healthLabel
+    };
+    pigs.set(id, pig);
+    drawPigHealth(pig);
+    return pig;
+}
+
+function spawnPigs() {
+    for (const pig of pigs.values()) {
+        scene.remove(pig.group);
+        pig.group.traverse(child => {
+            if (child.geometry) child.geometry.dispose();
+            if (child.material && child.material !== pigBodyMaterial && child.material !== pigHeadMaterial &&
+                child.material !== pigSnoutMaterial && child.material !== pigLegMaterial && child.material !== pigEyeMaterial) {
+                child.material.dispose();
+            }
+        });
+        pig.healthTexture.dispose();
+    }
+    pigs.clear();
+
+    // A seeded coordinate generator makes the pig spawn locations identical
+    // for every player in the same shared world.
+    let seed = (randomSeed ^ 0x6d2b79f5) >>> 0;
+    function nextRandom() {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed / 4294967296;
+    }
+
+    let created = 0;
+    for (let attempt = 0; attempt < 1200 && created < PIG_COUNT; attempt++) {
+        const x = Math.floor(nextRandom() * (WORLD_SIZE - 20)) - HALF_WORLD + 10;
+        const z = Math.floor(nextRandom() * (WORLD_SIZE - 20)) - HALF_WORLD + 10;
+        if (Math.hypot(x + 0.5, z + 0.5) < 12) continue;
+        if (!pigCanStandAt(x + 0.5, z + 0.5)) continue;
+        let tooClose = false;
+        for (const pig of pigs.values()) {
+            if (Math.hypot(pig.group.position.x - (x + 0.5), pig.group.position.z - (z + 0.5)) < 9) {
+                tooClose = true;
+                break;
+            }
+        }
+        if (tooClose) continue;
+        createPigEntity(`pig-${created}`, x, z, terrainHeight(x, z));
+        created++;
+    }
+}
+
+function applyPigHit(pigId, nextHealth, makeFlee = true, attackerId = null) {
+    const pig = pigs.get(pigId);
+    if (!pig || !Number.isFinite(nextHealth)) return;
+    pig.health = THREE.MathUtils.clamp(nextHealth, 0, PIG_MAX_HEALTH);
+    if (pig.health <= 0) {
+        scene.remove(pig.group);
+        pig.group.traverse(child => {
+            if (child.geometry) child.geometry.dispose();
+            if (child.material && child.material !== pigBodyMaterial && child.material !== pigHeadMaterial &&
+                child.material !== pigSnoutMaterial && child.material !== pigLegMaterial && child.material !== pigEyeMaterial) {
+                child.material.dispose();
+            }
+        });
+        pig.healthTexture.dispose();
+        pigs.delete(pigId);
+        showMessage("Pig defeated");
+        return;
+    }
+    drawPigHealth(pig);
+    pig.healthLabel.visible = true;
+    if (makeFlee) {
+        pig.fleeUntil = performance.now() + 2800;
+        const attacker = attackerId && attackerId !== multiplayerPlayerId
+            ? remotePlayers.get(attackerId)?.target
+            : null;
+        const attackerX = attacker && Number.isFinite(attacker.x) ? attacker.x : player.x;
+        const attackerZ = attacker && Number.isFinite(attacker.z) ? attacker.z : player.z;
+        const dx = pig.group.position.x - attackerX;
+        const dz = pig.group.position.z - attackerZ;
+        const length = Math.hypot(dx, dz) || 1;
+        pig.targetX = pig.group.position.x + (dx / length) * 6;
+        pig.targetZ = pig.group.position.z + (dz / length) * 6;
+        pig.targetTimer = 2.8;
+    }
+}
+
+function choosePigWanderTarget(pig) {
+    for (let attempt = 0; attempt < 14; attempt++) {
+        const angle = Math.random() * Math.PI * 2;
+        const distance = 3 + Math.random() * 6;
+        const x = pig.group.position.x + Math.cos(angle) * distance;
+        const z = pig.group.position.z + Math.sin(angle) * distance;
+        if (!pigCanStandAt(x, z)) continue;
+        const steps = 5;
+        let clearPath = true;
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            if (!pigCanStandAt(THREE.MathUtils.lerp(pig.group.position.x, x, t),
+                THREE.MathUtils.lerp(pig.group.position.z, z, t))) {
+                clearPath = false;
+                break;
+            }
+        }
+        if (clearPath) {
+            pig.targetX = x;
+            pig.targetZ = z;
+            pig.targetTimer = 2 + Math.random() * 3;
+            return;
+        }
+    }
+    pig.targetTimer = 0.6;
+}
+
+function updatePigs(delta) {
+    const now = performance.now();
+    for (const pig of pigs.values()) {
+        pig.targetTimer -= delta;
+        if (pig.targetTimer <= 0) choosePigWanderTarget(pig);
+
+        const dx = pig.targetX - pig.group.position.x;
+        const dz = pig.targetZ - pig.group.position.z;
+        const distance = Math.hypot(dx, dz);
+        const fleeing = now < pig.fleeUntil;
+        const speed = fleeing ? 1.55 : 0.82;
+
+        if (distance > 0.12) {
+            const step = Math.min(distance, speed * delta);
+            const nextX = pig.group.position.x + (dx / distance) * step;
+            const nextZ = pig.group.position.z + (dz / distance) * step;
+            if (pigCanStandAt(nextX, nextZ)) {
+                pig.group.position.x = nextX;
+                pig.group.position.z = nextZ;
+                const groundY = terrainHeight(Math.floor(nextX), Math.floor(nextZ));
+                pig.group.position.y = THREE.MathUtils.lerp(pig.group.position.y, groundY + 1, Math.min(1, delta * 8));
+                pig.group.rotation.y = Math.atan2(-dx, -dz);
+                pig.walkPhase += delta * (fleeing ? 10 : 5);
+                for (let i = 0; i < pig.legs.length; i++) {
+                    pig.legs[i].rotation.x = Math.sin(pig.walkPhase + (i % 2) * Math.PI) * (distance > 0.12 ? 0.42 : 0);
+                }
+            } else {
+                pig.targetTimer = 0;
+            }
+        } else {
+            for (const leg of pig.legs) leg.rotation.x *= 0.8;
+        }
+
+        if (pig.healthLabel.visible) {
+            pig.healthLabel.lookAt(camera.position);
+        }
+    }
 }
 
 // =====================================================
@@ -2444,6 +2770,7 @@ function animate() {
     if (gameStarted && !gamePaused && !gameOver) {
         if (keys["Space"] && grounded) jump();
         movePlayer(delta);
+        updatePigs(delta);
 
         if (!multiplayerReady && health < 20) {
             healthRegenElapsed += delta;
