@@ -383,12 +383,17 @@
             <label for="camera-sensitivity">Camera sensitivity <span id="camera-sensitivity-value">1.0×</span></label>
             <input id="camera-sensitivity" type="range" min="0.3" max="3" step="0.1" value="1">
             <div style="color:#bbb">Adjusts mouse and arrow-key camera movement.</div>
+            <label for="crouch-toggle-setting" style="display:flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer">
+                <input id="crouch-toggle-setting" type="checkbox" checked style="width:auto">
+                Crouch toggle (C)
+            </label>
+            <div style="color:#bbb;margin-top:4px">On: press C to toggle crouching. Off: hold C to crouch.</div>
         </div>
         <button id="start-button">PLAY WORLD</button>
         <div id="help">
             <strong>CONTROLS</strong><br>
             WASD: Move &nbsp; | &nbsp; Mouse / Arrow Keys: Look<br>
-            SPACE: Jump &nbsp; | &nbsp; SHIFT: Sprint &nbsp; | &nbsp; C: Crouch<br>
+            Hold SPACE: Auto-jump &nbsp; | &nbsp; SHIFT: Sprint &nbsp; | &nbsp; C: Crouch<br>
             Left Click / N: Punch player or break block &nbsp; | &nbsp; Right Click / M: Place<br>
             1–9: Select Hotbar Slot &nbsp; | &nbsp; P / ESC: Pause / Resume
         </div>
@@ -443,6 +448,7 @@ const CROUCH_HEIGHT = 1.3;
 const PLAYER_RADIUS = 0.30;
 const EYE_HEIGHT = 1.7;
 let crouching = false;
+let crouchToggleMode = true;
 
 function getPlayerHeight(isCrouching = crouching) {
     return isCrouching ? CROUCH_HEIGHT : PLAYER_HEIGHT;
@@ -611,6 +617,9 @@ function handleMultiplayerMessage(message) {
     } else if (message.type === "player_left") {
         removeRemotePlayer(message.id);
         updateOnlinePlayerCount();
+    } else if (message.type === "player_punched") {
+        const remote = remotePlayers.get(message.targetId);
+        if (remote) remote.hitFlashUntil = performance.now() + 300;
     } else if (message.type === "player_state") {
         if (message.player && message.player.id !== multiplayerPlayerId) {
             addOrUpdateRemotePlayer(message.player);
@@ -651,7 +660,7 @@ function handleMultiplayerMessage(message) {
 function isValidRemoteEdit(edit) {
     return !!edit && Number.isInteger(edit.x) && Number.isInteger(edit.y) && Number.isInteger(edit.z) &&
         isInsideWorld(edit.x, edit.z) && edit.y >= WORLD_BOTTOM && edit.y <= 40 &&
-        [0, BLOCK_GRASS, BLOCK_DIRT, BLOCK_WOOD, BLOCK_LEAVES].includes(edit.block);
+        [0, BLOCK_GRASS, BLOCK_DIRT, BLOCK_WATER, BLOCK_WOOD, BLOCK_LEAVES].includes(edit.block);
 }
 
 function createRemotePlayer(playerData) {
@@ -663,6 +672,7 @@ function createRemotePlayer(playerData) {
     );
     body.position.y = 0.65;
     body.userData.remotePlayerId = playerData.id;
+    body.userData.baseColor = body.material.color.getHex();
     body.castShadow = true;
     group.add(body);
     const head = new THREE.Mesh(
@@ -671,6 +681,7 @@ function createRemotePlayer(playerData) {
     );
     head.position.y = 1.56;
     head.userData.remotePlayerId = playerData.id;
+    head.userData.baseColor = head.material.color.getHex();
     head.castShadow = true;
     group.add(head);
     const labelCanvas = document.createElement("canvas");
@@ -745,6 +756,12 @@ function updateRemotePlayers(delta) {
         remote.group.position.y += (remote.target.y - remote.group.position.y) * amount;
         remote.group.position.z += (remote.target.z - remote.group.position.z) * amount;
         remote.group.rotation.y = remote.yaw;
+        const flashing = performance.now() < (remote.hitFlashUntil || 0);
+        for (const child of remote.group.children) {
+            if (child.material && child.material.color && Number.isFinite(child.userData.baseColor)) {
+                child.material.color.setHex(flashing ? 0xff2020 : child.userData.baseColor);
+            }
+        }
         const nameTag = remote.group.children.find(child => child.geometry && child.geometry.type === "PlaneGeometry");
         if (nameTag) nameTag.lookAt(camera.position);
     }
@@ -895,9 +912,9 @@ function punchPlayer() {
     return true;
 }
 
-function toggleCrouch() {
-    if (!gameStarted) return;
-    if (!crouching) {
+function setCrouching(nextCrouching) {
+    if (!gameStarted || crouching === nextCrouching) return;
+    if (nextCrouching) {
         crouching = true;
         player.y -= PLAYER_HEIGHT - CROUCH_HEIGHT;
     } else {
@@ -911,6 +928,10 @@ function toggleCrouch() {
     }
     camera.position.set(player.x, player.y, player.z);
     sendMultiplayerState(performance.now());
+}
+
+function toggleCrouch() {
+    setCrouching(!crouching);
 }
 
 window.addEventListener("beforeunload", disconnectMultiplayer);
@@ -1159,7 +1180,7 @@ function generateWorld() {
         for (let z = -HALF_WORLD + 3; z < HALF_WORLD - 3; z++) {
             const treeRoll = (Math.sin(x * 127.1 + z * 311.7 + randomSeed * 0.0001) * 43758.5453);
             const chance = treeRoll - Math.floor(treeRoll);
-            if (chance > 0.012) continue;
+            if (chance > 0.006) continue;
             if (Math.abs(x) < 6 && Math.abs(z) < 6) continue;
 
             const groundY = terrainHeight(x, z);
@@ -1733,6 +1754,12 @@ sensitivityInput.addEventListener("input", () => {
     sensitivityValue.textContent = `${cameraSensitivity.toFixed(1)}×`;
 });
 
+const crouchToggleSetting = document.getElementById("crouch-toggle-setting");
+crouchToggleSetting.addEventListener("change", () => {
+    crouchToggleMode = crouchToggleSetting.checked;
+    if (!crouchToggleMode && crouching) setCrouching(false);
+});
+
 startButton.addEventListener("click", startGame);
 
 // Pointer lock is used only to provide relative mouse movement. It never
@@ -1781,12 +1808,12 @@ document.addEventListener("keydown", event => {
     if (pauseState !== "playing" || gameOver || typingIntoControl) return;
     keys[event.code] = true;
 
-    if (event.repeat) return;
-
     if (event.code === "Space") {
         jump();
         return;
     }
+
+    if (event.repeat) return;
 
     const numberMatch = event.code.match(/^(?:Digit|Numpad)([1-9])$/);
     if (numberMatch) {
@@ -1798,12 +1825,14 @@ document.addEventListener("keydown", event => {
     } else if (event.code === "KeyF") {
         punchPlayer();
     } else if (event.code === "KeyC") {
-        toggleCrouch();
+        if (crouchToggleMode) toggleCrouch();
+        else setCrouching(true);
     }
 });
 
 document.addEventListener("keyup", event => {
     keys[event.code] = false;
+    if (event.code === "KeyC" && !crouchToggleMode) setCrouching(false);
 });
 
 document.addEventListener("contextmenu", event => {
@@ -2092,6 +2121,47 @@ function renderHotbar() {
 }
 
 // =====================================================
+// WATER SPREADING
+// =====================================================
+
+function spreadWaterFromAdjacentBlocks(x, y, z) {
+    // Water spreads sideways and downward into touching air, never upward.
+    const sourceOffsets = [
+        [1, 0, 0], [-1, 0, 0], [0, 1, 0],
+        [0, 0, 1], [0, 0, -1], [0, -1, 0]
+    ];
+    const spreadOffsets = [
+        [1, 0, 0], [-1, 0, 0],
+        [0, 0, 1], [0, 0, -1], [0, -1, 0]
+    ];
+    const waterTargets = new Set();
+
+    for (const [sx, sy, sz] of sourceOffsets) {
+        const sourceX = x + sx;
+        const sourceY = y + sy;
+        const sourceZ = z + sz;
+        if (getBlock(sourceX, sourceY, sourceZ) !== BLOCK_WATER) continue;
+
+        for (const [dx, dy, dz] of spreadOffsets) {
+            const targetX = sourceX + dx;
+            const targetY = sourceY + dy;
+            const targetZ = sourceZ + dz;
+            if (targetY < WORLD_BOTTOM || targetY > 40 || !isInsideWorld(targetX, targetZ)) continue;
+            if (getBlock(targetX, targetY, targetZ) !== 0) continue;
+            waterTargets.add(blockKey(targetX, targetY, targetZ));
+        }
+    }
+
+    for (const key of waterTargets) {
+        const [waterX, waterY, waterZ] = key.split(",").map(Number);
+        if (getBlock(waterX, waterY, waterZ) !== 0) continue;
+        setBlock(waterX, waterY, waterZ, BLOCK_WATER);
+        sendBlockEdit(waterX, waterY, waterZ, BLOCK_WATER);
+        rebuildAffectedChunks(waterX, waterZ);
+    }
+}
+
+// =====================================================
 // BREAKING BLOCKS
 // =====================================================
 
@@ -2116,6 +2186,7 @@ function breakBlock() {
     addInventory(type);
     setBlock(x, y, z, 0);
     sendBlockEdit(x, y, z, 0);
+    spreadWaterFromAdjacentBlocks(x, y, z);
 
     rebuildAffectedChunks(x, z);
     updateHUD();
@@ -2229,6 +2300,7 @@ function animate() {
     const delta = Math.min(clock.getDelta(), 0.05);
 
     if (gameStarted && !gamePaused && !gameOver) {
+        if (keys["Space"] && grounded) jump();
         movePlayer(delta);
 
         if (!multiplayerReady && health < 20) {
