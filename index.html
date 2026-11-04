@@ -721,6 +721,7 @@ const PLACEABLE_BLOCKS = [
 const ALL_SOLID_BLOCKS = PLACEABLE_BLOCKS;
 
 const itemDrops = [];
+let pendingItemPickupId = null;
 let eatingPorkchop = false;
 let eatingPorkchopElapsed = 0;
 const RAW_PORKCHOP_EAT_TIME = 1.6;
@@ -1067,11 +1068,21 @@ function handleMultiplayerMessage(message) {
     } else if (message.type === "item_drop_spawn") {
         addServerItemDrop(message.drop);
     } else if (message.type === "item_drop_removed") {
-        const drop = removeItemDropById(message.id);
+        removeItemDropById(message.id);
+        if (pendingItemPickupId === message.id) pendingItemPickupId = null;
         if (message.pickerId === multiplayerPlayerId && Number.isInteger(message.itemType) && Number.isInteger(message.count)) {
             if (addInventory(message.itemType, message.count)) {
                 showMessage(message.itemType === ITEM_RAW_PORKCHOP ? "Raw porkchop collected" : blockName(message.itemType) + " collected");
+            } else {
+                showMessage("Inventory full; item pickup could not be added");
             }
+        }
+    } else if (message.type === "item_pickup_rejected") {
+        if (pendingItemPickupId === message.id) pendingItemPickupId = null;
+        const rejectedDrop = itemDrops.find(drop => drop.id === message.id);
+        if (rejectedDrop) {
+            rejectedDrop.pickupRequested = false;
+            rejectedDrop.pickupRetryAt = performance.now() + 250;
         }
     } else if (message.type === "item_drop_rejected") {
         if (Number.isInteger(message.itemType) && Number.isInteger(message.count) && message.count > 0) {
@@ -3258,7 +3269,7 @@ function dropItemStack(stack, amount = stack?.count || 0) {
     const dropped = Math.min(amount, stack.count);
     const throwSpeed = 4.5;
     createItemDrop(stack.type, player.x, player.y - 0.45, player.z, dropped, null,
-        -Math.sin(yaw) * throwSpeed, -Math.cos(yaw) * throwSpeed);
+        -Math.sin(yaw) * throwSpeed, -Math.cos(yaw) * throwSpeed, true);
     stack.count -= dropped;
     if (stack.count <= 0) return null;
     return stack;
@@ -3276,7 +3287,7 @@ function dropSelectedItem() {
     const amount = 1;
     const throwSpeed = 4.5;
     createItemDrop(stack.type, player.x, player.y - 0.45, player.z, amount, null,
-        -Math.sin(yaw) * throwSpeed, -Math.cos(yaw) * throwSpeed);
+        -Math.sin(yaw) * throwSpeed, -Math.cos(yaw) * throwSpeed, true);
     stack.count -= amount;
     if (stack.count <= 0) {
         hotbar[selectedHotbarSlot] = null;
@@ -3335,9 +3346,9 @@ function createDroppedItemTexture(type) {
     return texture;
 }
 
-function createItemDrop(type, x, y, z, count = 1, serverData = null, velocityX = 0, velocityZ = 0) {
+function createItemDrop(type, x, y, z, count = 1, serverData = null, velocityX = 0, velocityZ = 0, playerDropped = false) {
     if (multiplayerReady && !serverData) {
-        multiplayerSend({ type: "item_drop_request", itemType: type, x, y, z, count, vx: velocityX, vz: velocityZ });
+        multiplayerSend({ type: "item_drop_request", itemType: type, x, y, z, count, vx: velocityX, vz: velocityZ, playerDropped });
         return null;
     }
     const group = new THREE.Group();
@@ -3366,9 +3377,10 @@ function createItemDrop(type, x, y, z, count = 1, serverData = null, velocityX =
         type, count, group, velocityY: 0,
         velocityX: Number.isFinite(serverData?.vx) ? serverData.vx : velocityX,
         velocityZ: Number.isFinite(serverData?.vz) ? serverData.vz : velocityZ,
-        pickupDelay: Number.isFinite(serverData?.pickupDelay) ? Math.max(0, serverData.pickupDelay) : 0.85,
+        pickupDelay: Number.isFinite(serverData?.pickupDelay) ? Math.max(0, serverData.pickupDelay) : (playerDropped ? 0.85 : 0),
         age: Math.random() * Math.PI * 2,
-        pickupRequested: false
+        pickupRequested: false,
+        pickupRetryAt: 0
     };
     itemDrops.push(drop);
     return drop;
@@ -3380,7 +3392,7 @@ function addServerItemDrop(data) {
         !Number.isFinite(data.x) || !Number.isFinite(data.y) || !Number.isFinite(data.z)) return;
     if (itemDrops.some(drop => drop.id === data.id)) return;
     const remainingDelay = Number.isFinite(data.pickupAvailableAt)
-        ? Math.max(0, (data.pickupAvailableAt - Date.now()) / 1000) : 0.85;
+        ? Math.max(0, (data.pickupAvailableAt - Date.now()) / 1000) : 0;
     const elapsed = Number.isFinite(data.createdAt) ? Math.max(0, (Date.now() - data.createdAt) / 1000) : 0;
     const travel = (1 - Math.exp(-3 * elapsed)) / 3;
     const initialVX = Number.isFinite(data.vx) ? data.vx : 0;
@@ -3416,6 +3428,7 @@ function clearItemDrops() {
         });
     }
     itemDrops.length = 0;
+    pendingItemPickupId = null;
 }
 
 function getItemDropGroundY(x, z, currentY) {
@@ -3462,9 +3475,16 @@ function updateItemDrops(delta) {
             pos.z >= playerMinZ && pos.z <= playerMaxZ &&
             pos.y >= playerMinY && pos.y <= playerMaxY) {
             if (multiplayerReady && drop.id) {
-                if (!drop.pickupRequested && canAddInventory(drop.type, drop.count || 1)) {
+                const now = performance.now();
+                if (!pendingItemPickupId && !drop.pickupRequested && now >= (drop.pickupRetryAt || 0) &&
+                    canAddInventory(drop.type, drop.count || 1)) {
                     drop.pickupRequested = true;
-                    if (!multiplayerSend({ type: "item_pickup_request", id: drop.id })) drop.pickupRequested = false;
+                    pendingItemPickupId = drop.id;
+                    if (!multiplayerSend({ type: "item_pickup_request", id: drop.id })) {
+                        drop.pickupRequested = false;
+                        drop.pickupRetryAt = now + 250;
+                        pendingItemPickupId = null;
+                    }
                 }
             } else if (addInventory(drop.type, drop.count || 1)) {
                 scene.remove(drop.group);
