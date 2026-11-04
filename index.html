@@ -3128,21 +3128,66 @@ function dropSelectedItem() {
     updateHUD();
 }
 
+function createDroppedItemTexture(type) {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 32;
+    const ctx = canvas.getContext("2d");
+    const toolTier = [ITEM_WOOD_PICKAXE, ITEM_WOOD_SHOVEL, ITEM_WOOD_AXE].includes(type) ? "wood" :
+        [ITEM_STONE_PICKAXE, ITEM_STONE_SHOVEL, ITEM_STONE_AXE].includes(type) ? "stone" :
+        [ITEM_IRON_PICKAXE, ITEM_IRON_SHOVEL, ITEM_IRON_AXE].includes(type) ? "iron" :
+        [ITEM_DIAMOND_PICKAXE, ITEM_DIAMOND_SHOVEL, ITEM_DIAMOND_AXE].includes(type) ? "diamond" : null;
+    if (toolTier) {
+        const headColors = { wood: ["#d5a46a", "#80502c"], stone: ["#d0d0d0", "#696969"], iron: ["#f0f0f0", "#9babb4"], diamond: ["#b9fff7", "#20a9b4"] };
+        ctx.save(); ctx.translate(16, 16); ctx.rotate(-0.55);
+        ctx.fillStyle = "#80502c"; ctx.fillRect(-2, -1, 4, 20);
+        ctx.strokeStyle = "#4b2c19"; ctx.strokeRect(-2, -1, 4, 20);
+        ctx.fillStyle = headColors[toolTier][0]; ctx.strokeStyle = headColors[toolTier][1]; ctx.lineWidth = 2;
+        if ([ITEM_WOOD_PICKAXE, ITEM_STONE_PICKAXE, ITEM_IRON_PICKAXE, ITEM_DIAMOND_PICKAXE].includes(type)) {
+            ctx.beginPath(); ctx.moveTo(-13, -8); ctx.lineTo(-8, -13); ctx.lineTo(-1, -10); ctx.lineTo(8, -15); ctx.lineTo(14, -11); ctx.lineTo(10, -5); ctx.lineTo(2, -6); ctx.lineTo(-5, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
+        } else if ([ITEM_WOOD_SHOVEL, ITEM_STONE_SHOVEL, ITEM_IRON_SHOVEL, ITEM_DIAMOND_SHOVEL].includes(type)) {
+            ctx.beginPath(); ctx.moveTo(-5, -13); ctx.lineTo(5, -13); ctx.lineTo(8, -3); ctx.lineTo(0, 3); ctx.lineTo(-8, -3); ctx.closePath(); ctx.fill(); ctx.stroke();
+        } else {
+            ctx.fillRect(-8, -14, 15, 8); ctx.strokeRect(-8, -14, 15, 8);
+        }
+        ctx.restore();
+    } else if (type === ITEM_RAW_PORKCHOP || type === ITEM_COOKED_PORKCHOP) {
+        ctx.fillStyle = type === ITEM_RAW_PORKCHOP ? "#b84b55" : "#8d3f31";
+        ctx.beginPath(); ctx.roundRect(4, 6, 24, 20, 6); ctx.fill();
+        ctx.fillStyle = "#f0c9b8"; ctx.fillRect(21, 12, 8, 5); ctx.fillRect(25, 9, 4, 11);
+        ctx.fillStyle = type === ITEM_RAW_PORKCHOP ? "#e58b91" : "#c47a48"; ctx.fillRect(8, 10, 8, 4);
+    } else if (type === ITEM_BUCKET || type === ITEM_WATER_BUCKET) {
+        ctx.strokeStyle = "#777"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(16, 12, 10, Math.PI, 0); ctx.stroke();
+        ctx.fillStyle = "#bfc7cc"; ctx.beginPath(); ctx.moveTo(6, 12); ctx.lineTo(26, 12); ctx.lineTo(23, 27); ctx.lineTo(9, 27); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = "#626b70"; ctx.stroke();
+        if (type === ITEM_WATER_BUCKET) { ctx.fillStyle = "#269bd8"; ctx.fillRect(9, 17, 14, 8); }
+    } else {
+        const colors = { [ITEM_STICK]: "#a87543", [ITEM_COAL]: "#242424", [ITEM_RAW_IRON]: "#bd987d", [ITEM_IRON_INGOT]: "#c8c8c8", [ITEM_DIAMOND]: "#42d9d1" };
+        const color = colors[type] || "#aaaaaa";
+        ctx.fillStyle = color;
+        if (type === ITEM_STICK) { ctx.save(); ctx.translate(16, 16); ctx.rotate(-0.55); ctx.fillRect(-3, -13, 6, 26); ctx.fillStyle = "#d1a06b"; ctx.fillRect(-2, -10, 2, 18); ctx.restore(); }
+        else if (type === ITEM_DIAMOND) { ctx.beginPath(); ctx.moveTo(5, 12); ctx.lineTo(11, 5); ctx.lineTo(22, 5); ctx.lineTo(28, 12); ctx.lineTo(16, 28); ctx.closePath(); ctx.fill(); ctx.fillStyle = "#b9fff7"; ctx.fillRect(12, 8, 7, 4); }
+        else if (type === ITEM_IRON_INGOT) { ctx.beginPath(); ctx.moveTo(5, 12); ctx.lineTo(11, 7); ctx.lineTo(27, 7); ctx.lineTo(22, 24); ctx.lineTo(6, 24); ctx.closePath(); ctx.fill(); ctx.strokeStyle = "#777"; ctx.stroke(); }
+        else { ctx.beginPath(); ctx.moveTo(7, 8); ctx.lineTo(24, 5); ctx.lineTo(28, 20); ctx.lineTo(15, 27); ctx.lineTo(4, 19); ctx.closePath(); ctx.fill(); }
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.magFilter = THREE.NearestFilter;
+    texture.minFilter = THREE.NearestFilter;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+}
+
 function createItemDrop(type, x, y, z, count = 1) {
     const group = new THREE.Group();
-    if (type === ITEM_RAW_PORKCHOP) {
-        const meat = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.22, 0.25), porkchopMeatMaterial);
-        meat.rotation.set(0.12, 0.35, -0.18);
-        group.add(meat);
-        const bone = new THREE.Mesh(new THREE.BoxGeometry(0.19, 0.09, 0.09), porkchopFatMaterial);
-        bone.position.set(0.17, 0.02, 0.04);
-        bone.rotation.z = -0.25;
-        group.add(bone);
-    } else {
-        const material = itemBlockMaterials[type] || itemMaterials[type];
-        if (!material) return null;
-        const cube = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.32, 0.32), material);
+    const blockMaterial = itemBlockMaterials[type];
+    if (blockMaterial) {
+        const cube = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.32, 0.32), blockMaterial);
         group.add(cube);
+    } else {
+        const texture = createDroppedItemTexture(type);
+        const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, side: THREE.DoubleSide, depthWrite: false });
+        const sprite = new THREE.Mesh(new THREE.PlaneGeometry(0.34, 0.34), material);
+        sprite.rotation.x = -Math.PI / 2;
+        group.add(sprite);
     }
     group.position.set(x, y, z);
     group.rotation.y = Math.random() * Math.PI * 2;
@@ -3153,7 +3198,7 @@ function createItemDrop(type, x, y, z, count = 1) {
         }
     });
     scene.add(group);
-    const drop = { type, count, group, velocityY: 0, age: Math.random() * Math.PI * 2 };
+    const drop = { type, count, group, velocityY: 0, pickupDelay: 0.85, age: Math.random() * Math.PI * 2 };
     itemDrops.push(drop);
     return drop;
 }
@@ -3179,6 +3224,7 @@ function updateItemDrops(delta) {
     for (let i = itemDrops.length - 1; i >= 0; i--) {
         const drop = itemDrops[i];
         drop.age += delta;
+        drop.pickupDelay = Math.max(0, (drop.pickupDelay || 0) - delta);
         const pos = drop.group.position;
         drop.velocityY -= 18 * delta;
         pos.y += drop.velocityY * delta;
@@ -3192,7 +3238,8 @@ function updateItemDrops(delta) {
 
         // Pickup bounds extend one voxel horizontally beyond the player hitbox;
         // the vertical bounds remain the player's normal hitbox height.
-        if (pos.x >= playerMinX && pos.x <= playerMaxX &&
+        if (drop.pickupDelay <= 0 &&
+            pos.x >= playerMinX && pos.x <= playerMaxX &&
             pos.z >= playerMinZ && pos.z <= playerMaxZ &&
             pos.y >= playerMinY && pos.y <= playerMaxY) {
             if (addInventory(drop.type, drop.count || 1)) {
