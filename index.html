@@ -710,6 +710,8 @@ const ITEM_WOOD_AXE = 45;
 const ITEM_STONE_AXE = 46;
 const ITEM_IRON_AXE = 47;
 const ITEM_DIAMOND_AXE = 48;
+const ITEM_RAW_BEEF = 49;
+const ITEM_STEAK = 50;
 
 const PLACEABLE_BLOCKS = [
     BLOCK_GRASS, BLOCK_DIRT, BLOCK_WOOD, BLOCK_LEAVES, BLOCK_STONE,
@@ -815,6 +817,9 @@ const PIG_COUNT = 14;
 const PIG_MAX_HEALTH = 10;
 const PIG_PUNCH_DAMAGE = 1;
 const pigs = new Map();
+const cows = new Map();
+const COW_COUNT = 10;
+const COW_MAX_HEALTH = 10;
 
 function multiplayerStatus(message) {
     const element = document.getElementById("multiplayer-status");
@@ -997,6 +1002,11 @@ function handleMultiplayerMessage(message) {
                     }
                 }
             }
+            if (Array.isArray(message.cowHealth)) {
+                for (const entry of message.cowHealth) {
+                    if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1])) applyCowHit(entry[0], entry[1], false);
+                }
+            }
             if (message.spawn && Number.isFinite(message.spawn.x) && Number.isFinite(message.spawn.z)) {
                 player.x = message.spawn.x;
                 player.z = message.spawn.z;
@@ -1040,6 +1050,8 @@ function handleMultiplayerMessage(message) {
         if (remote) remote.hitFlashUntil = performance.now() + 300;
     } else if (message.type === "pig_hit") {
         applyPigHit(message.pigId, message.health, true, message.attackerId);
+    } else if (message.type === "cow_hit") {
+        applyCowHit(message.cowId, message.health, true, message.attackerId);
     } else if (message.type === "player_state") {
         if (message.player && message.player.id !== multiplayerPlayerId) {
             addOrUpdateRemotePlayer(message.player);
@@ -1092,9 +1104,12 @@ function handleMultiplayerMessage(message) {
             for (const edit of message.edits) if (isValidRemoteEdit(edit)) setBlock(edit.x, edit.y, edit.z, edit.block);
             if (Array.isArray(message.pigHealth)) {
                 for (const entry of message.pigHealth) {
-                    if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1])) {
-                        applyPigHit(entry[0], entry[1], false);
-                    }
+                    if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1])) applyPigHit(entry[0], entry[1], false);
+                }
+            }
+            if (Array.isArray(message.cowHealth)) {
+                for (const entry of message.cowHealth) {
+                    if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1])) applyCowHit(entry[0], entry[1], false);
                 }
             }
             rebuildWorldMeshes();
@@ -1357,7 +1372,7 @@ function findLookedAtRemotePlayer() {
 }
 
 function findLookedAtPig() {
-    if (pigs.size === 0) return null;
+    if (pigs.size === 0 && cows.size === 0) return null;
 
     camera.updateMatrixWorld(true);
     scene.updateMatrixWorld(true);
@@ -1366,10 +1381,10 @@ function findLookedAtPig() {
     remotePlayerRaycaster.far = PUNCH_REACH;
 
     const targetMeshes = [];
-    for (const pig of pigs.values()) {
-        if (pig.health <= 0) continue;
-        pig.group.traverse(child => {
-            if (child.isMesh && child.userData.pigId === pig.id) targetMeshes.push(child);
+    for (const animal of [...pigs.values(), ...cows.values()]) {
+        if (animal.health <= 0) continue;
+        animal.group.traverse(child => {
+            if (child.isMesh && child.userData.animalId === animal.id) targetMeshes.push(child);
         });
     }
 
@@ -1378,7 +1393,7 @@ function findLookedAtPig() {
     if (intersections.length === 0) return null;
 
     const nearestHit = intersections[0];
-    const pigId = nearestHit.object.userData.pigId;
+    const pigId = nearestHit.object.userData.animalId;
     if (!pigId) return null;
 
     const blockTarget = getTargetBlock();
@@ -1403,16 +1418,18 @@ function punchPlayer() {
     if (targetId) {
         multiplayerSend({ type: "punch", targetId, yaw });
     } else {
-        const pig = pigs.get(pigId);
+        const isCow = pigId.startsWith("cow-");
+        const animal = isCow ? cows.get(pigId) : pigs.get(pigId);
         if (multiplayerReady) {
             multiplayerSend({
-                type: "pig_punch",
-                pigId,
+                type: isCow ? "cow_punch" : "pig_punch",
+                [isCow ? "cowId" : "pigId"]: pigId,
                 yaw,
-                position: pig ? { x: pig.group.position.x, y: pig.group.position.y, z: pig.group.position.z } : null
+                position: animal ? { x: animal.group.position.x, y: animal.group.position.y, z: animal.group.position.z } : null
             });
-        } else if (pig) {
-            applyPigHit(pigId, Math.max(0, pig.health - PIG_PUNCH_DAMAGE), true);
+        } else if (animal) {
+            if (isCow) applyCowHit(pigId, Math.max(0, animal.health - PIG_PUNCH_DAMAGE), true);
+            else applyPigHit(pigId, Math.max(0, animal.health - PIG_PUNCH_DAMAGE), true);
         }
     }
     showMessage("Punch!");
@@ -1772,6 +1789,7 @@ function generateWorld() {
 
     camera.position.set(player.x, player.y, player.z);
     spawnPigs();
+    spawnCows();
 }
 
 // =====================================================
@@ -1815,6 +1833,7 @@ function createPigEntity(id, x, z, groundY) {
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         mesh.userData.pigId = id;
+        mesh.userData.animalId = id;
         group.add(mesh);
         parts.push(mesh);
         return mesh;
@@ -1886,6 +1905,77 @@ function spawnPigs() {
         }
         if (tooClose) continue;
         createPigEntity(`pig-${created}`, x, z, terrainHeight(x, z));
+        created++;
+    }
+}
+
+const cowBodyMaterial = new THREE.MeshStandardMaterial({ color: 0x8b5735, roughness: 0.95 });
+const cowPatchMaterial = new THREE.MeshStandardMaterial({ color: 0xf0e9d9, roughness: 1 });
+const cowHeadMaterial = new THREE.MeshStandardMaterial({ color: 0x765039, roughness: 0.95 });
+const cowMuzzleMaterial = new THREE.MeshStandardMaterial({ color: 0xc99a82, roughness: 0.95 });
+const cowHornMaterial = new THREE.MeshStandardMaterial({ color: 0xe8dfc8, roughness: 0.8 });
+
+function createCowEntity(id, x, z, groundY) {
+    const group = new THREE.Group();
+    const parts = [];
+    function addPart(geometry, material, px, py, pz) {
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.set(px, py, pz);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.userData.animalId = id;
+        group.add(mesh);
+        parts.push(mesh);
+        return mesh;
+    }
+    addPart(new THREE.BoxGeometry(0.92, 0.88, 1.18), cowBodyMaterial, 0, 0.88, 0.02);
+    addPart(new THREE.BoxGeometry(0.42, 0.48, 0.50), cowPatchMaterial, -0.24, 1.02, -0.12).rotation.y = 0.25;
+    addPart(new THREE.BoxGeometry(0.38, 0.40, 0.48), cowPatchMaterial, 0.25, 0.68, 0.28).rotation.y = -0.3;
+    addPart(new THREE.BoxGeometry(0.58, 0.62, 0.58), cowHeadMaterial, 0, 1.22, -0.70);
+    addPart(new THREE.BoxGeometry(0.42, 0.24, 0.18), cowMuzzleMaterial, 0, 1.04, -1.02);
+    addPart(new THREE.BoxGeometry(0.10, 0.20, 0.10), cowHornMaterial, -0.25, 1.62, -0.62).rotation.z = -0.35;
+    addPart(new THREE.BoxGeometry(0.10, 0.20, 0.10), cowHornMaterial, 0.25, 1.62, -0.62).rotation.z = 0.35;
+    addPart(new THREE.BoxGeometry(0.07, 0.07, 0.035), pigEyeMaterial, -0.20, 1.30, -0.99);
+    addPart(new THREE.BoxGeometry(0.07, 0.07, 0.035), pigEyeMaterial, 0.20, 1.30, -0.99);
+    const legs = [];
+    for (const lx of [-0.29, 0.29]) for (const lz of [-0.38, 0.38]) {
+        legs.push(addPart(new THREE.BoxGeometry(0.22, 0.48, 0.22), cowHeadMaterial, lx, 0.24, lz));
+    }
+    group.position.set(x + 0.5, groundY + 1, z + 0.5);
+    scene.add(group);
+    const cow = {
+        id, group, legs, health: COW_MAX_HEALTH,
+        targetX: x + 0.5, targetZ: z + 0.5,
+        targetTimer: 1 + Math.random() * 2, movingToGoal: false, path: null, pathIndex: 0, fleeUntil: 0,
+        walkPhase: Math.random() * Math.PI * 2, verticalVelocity: 0,
+        parts, originalMaterials: parts.map(part => part.material), flashUntil: 0
+    };
+    cows.set(id, cow);
+    return cow;
+}
+
+function spawnCows() {
+    for (const cow of cows.values()) {
+        scene.remove(cow.group);
+        cow.group.traverse(child => { if (child.geometry) child.geometry.dispose(); });
+    }
+    cows.clear();
+    let seed = (randomSeed ^ 0x3c6ef372) >>> 0;
+    function nextRandom() {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed / 4294967296;
+    }
+    let created = 0;
+    for (let attempt = 0; attempt < 1600 && created < COW_COUNT; attempt++) {
+        const x = Math.floor(nextRandom() * (WORLD_SIZE - 20)) - HALF_WORLD + 10;
+        const z = Math.floor(nextRandom() * (WORLD_SIZE - 20)) - HALF_WORLD + 10;
+        if (Math.hypot(x + 0.5, z + 0.5) < 15 || !pigCanStandAt(x + 0.5, z + 0.5)) continue;
+        let tooClose = false;
+        for (const animal of [...pigs.values(), ...cows.values()]) {
+            if (Math.hypot(animal.group.position.x - (x + 0.5), animal.group.position.z - (z + 0.5)) < 7) { tooClose = true; break; }
+        }
+        if (tooClose) continue;
+        createCowEntity(`cow-${created}`, x, z, terrainHeight(x, z));
         created++;
     }
 }
@@ -1989,6 +2079,45 @@ function applyPigHit(pigId, nextHealth, makeFlee = true, attackerId = null) {
     }
 }
 
+function applyCowHit(cowId, nextHealth, makeFlee = true, attackerId = null) {
+    const cow = cows.get(cowId);
+    if (!cow || !Number.isFinite(nextHealth)) return;
+    cow.health = THREE.MathUtils.clamp(nextHealth, 0, COW_MAX_HEALTH);
+    if (cow.health <= 0) {
+        if (makeFlee && (!multiplayerReady || attackerId === multiplayerPlayerId)) {
+            let dropHash = 0;
+            for (let i = 0; i < cowId.length; i++) dropHash = (Math.imul(dropHash, 31) + cowId.charCodeAt(i)) >>> 0;
+            const beefCount = 1 + (dropHash % 3);
+            for (let i = 0; i < beefCount; i++) {
+                createItemDrop(ITEM_RAW_BEEF,
+                    cow.group.position.x + (Math.random() - 0.5) * 0.55,
+                    cow.group.position.y + 0.3 + Math.random() * 0.12,
+                    cow.group.position.z + (Math.random() - 0.5) * 0.55);
+            }
+        }
+        scene.remove(cow.group);
+        cow.group.traverse(child => { if (child.geometry) child.geometry.dispose(); });
+        cows.delete(cowId);
+        showMessage("Cow defeated");
+        return;
+    }
+    cow.flashUntil = performance.now() + 220;
+    for (const part of cow.parts) part.material = pigFlashMaterial;
+    if (makeFlee) {
+        cow.fleeUntil = performance.now() + 2800;
+        const attacker = attackerId && attackerId !== multiplayerPlayerId ? remotePlayers.get(attackerId)?.target : null;
+        const attackerX = attacker && Number.isFinite(attacker.x) ? attacker.x : player.x;
+        const attackerZ = attacker && Number.isFinite(attacker.z) ? attacker.z : player.z;
+        const dx = cow.group.position.x - attackerX, dz = cow.group.position.z - attackerZ;
+        const length = Math.hypot(dx, dz) || 1;
+        const fleePath = findPigPath(cow.group.position.x, cow.group.position.z,
+            cow.group.position.x + dx / length * 13, cow.group.position.z + dz / length * 13);
+        if (fleePath && fleePath.length) {
+            cow.path = fleePath; cow.pathIndex = 0; cow.targetX = fleePath[0].x; cow.targetZ = fleePath[0].z; cow.movingToGoal = true;
+        } else { cow.movingToGoal = false; cow.targetTimer = 0.15; }
+    }
+}
+
 function choosePigWanderTarget(pig) {
     // Choose a distant destination and use a grid path around water and solid obstacles.
     for (let attempt = 0; attempt < 24; attempt++) {
@@ -2013,7 +2142,7 @@ function choosePigWanderTarget(pig) {
 
 function updatePigs(delta) {
     const now = performance.now();
-    for (const pig of pigs.values()) {
+    for (const pig of [...pigs.values(), ...cows.values()]) {
         if (pig.flashUntil && now >= pig.flashUntil) {
             for (let i = 0; i < pig.parts.length; i++) {
                 pig.parts[i].material = pig.originalMaterials[i];
@@ -3127,7 +3256,9 @@ function getTargetBlock() {
 function dropItemStack(stack, amount = stack?.count || 0) {
     if (!stack || amount <= 0) return;
     const dropped = Math.min(amount, stack.count);
-    createItemDrop(stack.type, player.x, player.y - 0.45, player.z, dropped);
+    const throwSpeed = 4.5;
+    createItemDrop(stack.type, player.x, player.y - 0.45, player.z, dropped, null,
+        -Math.sin(yaw) * throwSpeed, -Math.cos(yaw) * throwSpeed);
     stack.count -= dropped;
     if (stack.count <= 0) return null;
     return stack;
@@ -3143,7 +3274,9 @@ function dropSelectedItem() {
     const stack = hotbar[selectedHotbarSlot];
     if (!stack) return;
     const amount = 1;
-    createItemDrop(stack.type, player.x, player.y - 0.45, player.z, amount);
+    const throwSpeed = 4.5;
+    createItemDrop(stack.type, player.x, player.y - 0.45, player.z, amount, null,
+        -Math.sin(yaw) * throwSpeed, -Math.cos(yaw) * throwSpeed);
     stack.count -= amount;
     if (stack.count <= 0) {
         hotbar[selectedHotbarSlot] = null;
@@ -3174,11 +3307,13 @@ function createDroppedItemTexture(type) {
             ctx.fillRect(-8, -14, 15, 8); ctx.strokeRect(-8, -14, 15, 8);
         }
         ctx.restore();
-    } else if (type === ITEM_RAW_PORKCHOP || type === ITEM_COOKED_PORKCHOP) {
-        ctx.fillStyle = type === ITEM_RAW_PORKCHOP ? "#b84b55" : "#8d3f31";
+    } else if ([ITEM_RAW_PORKCHOP, ITEM_COOKED_PORKCHOP, ITEM_RAW_BEEF, ITEM_STEAK].includes(type)) {
+        const rawMeat = type === ITEM_RAW_PORKCHOP || type === ITEM_RAW_BEEF;
+        const beef = type === ITEM_RAW_BEEF || type === ITEM_STEAK;
+        ctx.fillStyle = rawMeat ? (beef ? "#a93635" : "#b84b55") : (beef ? "#713b28" : "#8d3f31");
         ctx.beginPath(); ctx.roundRect(4, 6, 24, 20, 6); ctx.fill();
         ctx.fillStyle = "#f0c9b8"; ctx.fillRect(21, 12, 8, 5); ctx.fillRect(25, 9, 4, 11);
-        ctx.fillStyle = type === ITEM_RAW_PORKCHOP ? "#e58b91" : "#c47a48"; ctx.fillRect(8, 10, 8, 4);
+        ctx.fillStyle = rawMeat ? (beef ? "#d85b52" : "#e58b91") : "#c47a48"; ctx.fillRect(8, 10, 8, 4);
     } else if (type === ITEM_BUCKET || type === ITEM_WATER_BUCKET) {
         ctx.strokeStyle = "#777"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(16, 12, 10, Math.PI, 0); ctx.stroke();
         ctx.fillStyle = "#bfc7cc"; ctx.beginPath(); ctx.moveTo(6, 12); ctx.lineTo(26, 12); ctx.lineTo(23, 27); ctx.lineTo(9, 27); ctx.closePath(); ctx.fill();
@@ -3200,9 +3335,9 @@ function createDroppedItemTexture(type) {
     return texture;
 }
 
-function createItemDrop(type, x, y, z, count = 1, serverData = null) {
+function createItemDrop(type, x, y, z, count = 1, serverData = null, velocityX = 0, velocityZ = 0) {
     if (multiplayerReady && !serverData) {
-        multiplayerSend({ type: "item_drop_request", itemType: type, x, y, z, count });
+        multiplayerSend({ type: "item_drop_request", itemType: type, x, y, z, count, vx: velocityX, vz: velocityZ });
         return null;
     }
     const group = new THREE.Group();
@@ -3229,6 +3364,8 @@ function createItemDrop(type, x, y, z, count = 1, serverData = null) {
     const drop = {
         id: serverData?.id || null,
         type, count, group, velocityY: 0,
+        velocityX: Number.isFinite(serverData?.vx) ? serverData.vx : velocityX,
+        velocityZ: Number.isFinite(serverData?.vz) ? serverData.vz : velocityZ,
         pickupDelay: Number.isFinite(serverData?.pickupDelay) ? Math.max(0, serverData.pickupDelay) : 0.85,
         age: Math.random() * Math.PI * 2,
         pickupRequested: false
@@ -3244,9 +3381,15 @@ function addServerItemDrop(data) {
     if (itemDrops.some(drop => drop.id === data.id)) return;
     const remainingDelay = Number.isFinite(data.pickupAvailableAt)
         ? Math.max(0, (data.pickupAvailableAt - Date.now()) / 1000) : 0.85;
-    createItemDrop(data.itemType, data.x, data.y, data.z, data.count, {
+    const elapsed = Number.isFinite(data.createdAt) ? Math.max(0, (Date.now() - data.createdAt) / 1000) : 0;
+    const travel = (1 - Math.exp(-3 * elapsed)) / 3;
+    const initialVX = Number.isFinite(data.vx) ? data.vx : 0;
+    const initialVZ = Number.isFinite(data.vz) ? data.vz : 0;
+    createItemDrop(data.itemType, data.x + initialVX * travel, data.y, data.z + initialVZ * travel, data.count, {
         id: data.id,
-        pickupDelay: remainingDelay
+        pickupDelay: remainingDelay,
+        vx: initialVX * Math.exp(-3 * elapsed),
+        vz: initialVZ * Math.exp(-3 * elapsed)
     });
 }
 
@@ -3298,6 +3441,10 @@ function updateItemDrops(delta) {
         drop.age += delta;
         drop.pickupDelay = Math.max(0, (drop.pickupDelay || 0) - delta);
         const pos = drop.group.position;
+        pos.x += (drop.velocityX || 0) * delta;
+        pos.z += (drop.velocityZ || 0) * delta;
+        drop.velocityX = (drop.velocityX || 0) * Math.exp(-3 * delta);
+        drop.velocityZ = (drop.velocityZ || 0) * Math.exp(-3 * delta);
         drop.velocityY -= 18 * delta;
         pos.y += drop.velocityY * delta;
         const floorY = getItemDropGroundY(pos.x, pos.z, pos.y + 0.2);
@@ -3331,9 +3478,10 @@ function updateItemDrops(delta) {
 
 function startEatingPorkchop() {
     const stack = hotbar[selectedHotbarSlot];
-    if (!stack || stack.type !== ITEM_RAW_PORKCHOP || stack.count <= 0) return false;
+    const foodTypes = [ITEM_RAW_PORKCHOP, ITEM_COOKED_PORKCHOP, ITEM_RAW_BEEF, ITEM_STEAK];
+    if (!stack || !foodTypes.includes(stack.type) || stack.count <= 0) return false;
     if (gameMode === "creative") {
-        showMessage("You can eat raw porkchop in Survival mode");
+        showMessage("You can eat food in Survival mode");
         return true;
     }
     if (eatingPorkchop) return true;
@@ -3346,17 +3494,27 @@ function startEatingPorkchop() {
 function updateEatingPorkchop(delta) {
     if (!eatingPorkchop) return;
     const stack = hotbar[selectedHotbarSlot];
-    if (!stack || stack.type !== ITEM_RAW_PORKCHOP || stack.count <= 0 || inventoryOpen) {
+    if (!stack || ![ITEM_RAW_PORKCHOP, ITEM_COOKED_PORKCHOP, ITEM_RAW_BEEF, ITEM_STEAK].includes(stack.type) || stack.count <= 0 || inventoryOpen) {
         eatingPorkchop = false;
         eatingPorkchopElapsed = 0;
         return;
     }
     eatingPorkchopElapsed += delta;
     if (eatingPorkchopElapsed >= RAW_PORKCHOP_EAT_TIME) {
-        removeInventory(ITEM_RAW_PORKCHOP);
+        const foodType = stack.type;
+        const restore = [ITEM_COOKED_PORKCHOP, ITEM_STEAK].includes(foodType) ? 4 : 2;
+        removeInventory(foodType);
+        if (!multiplayerReady) {
+            health = Math.min(20, health + restore);
+            updateHealthDisplay();
+        } else {
+            multiplayerSend({ type: "eat_food", amount: restore });
+        }
         eatingPorkchop = false;
         eatingPorkchopElapsed = 0;
-        showMessage("Ate raw porkchop (no effect)");
+        showMessage(foodType === ITEM_RAW_PORKCHOP ? "Ate raw porkchop (+1 heart)" :
+            foodType === ITEM_COOKED_PORKCHOP ? "Ate cooked porkchop (+2 hearts)" :
+            foodType === ITEM_RAW_BEEF ? "Ate raw beef (+1 heart)" : "Ate steak (+2 hearts)");
     }
 }
 
@@ -3391,6 +3549,8 @@ function blockName(type) {
         [BLOCK_CHEST]: "chest",
         [ITEM_RAW_PORKCHOP]: "raw porkchop",
         [ITEM_COOKED_PORKCHOP]: "cooked porkchop",
+        [ITEM_RAW_BEEF]: "raw beef",
+        [ITEM_STEAK]: "steak",
         [ITEM_PLANKS]: "planks",
         [ITEM_STICK]: "stick",
         [ITEM_COAL]: "coal",
@@ -3418,6 +3578,8 @@ function blockName(type) {
 function inventoryIconClass(type) {
     if (type === ITEM_RAW_PORKCHOP) return "raw-porkchop";
     if (type === ITEM_COOKED_PORKCHOP) return "cooked-porkchop";
+    if (type === ITEM_RAW_BEEF) return "raw-porkchop";
+    if (type === ITEM_STEAK) return "cooked-porkchop";
     const toolIcons = {
         [ITEM_WOOD_PICKAXE]: "tool-icon tool-pickaxe wood-tool wooden-pickaxe",
         [ITEM_STONE_PICKAXE]: "tool-icon tool-pickaxe stone-tool stone-pickaxe",
@@ -3890,8 +4052,8 @@ function handleFurnaceSlotClick(slotName, button) {
             showMessage("Coal is the furnace fuel");
             return;
         }
-        if (slotName === "input" && ![ITEM_RAW_IRON, ITEM_RAW_PORKCHOP].includes(carriedItemStack.type)) {
-            showMessage("Furnace input must be raw iron or raw porkchop");
+        if (slotName === "input" && ![ITEM_RAW_IRON, ITEM_RAW_PORKCHOP, ITEM_RAW_BEEF].includes(carriedItemStack.type)) {
+            showMessage("Furnace input must be raw iron, raw porkchop, or raw beef");
             return;
         }
     }
@@ -3973,8 +4135,9 @@ function renderChestUI() {
 
 function updateFurnaces(delta) {
     for (const state of furnaceStates.values()) {
-        if (!state.input || ![ITEM_RAW_IRON, ITEM_RAW_PORKCHOP].includes(state.input.type)) continue;
-        const outputType = state.input.type === ITEM_RAW_IRON ? ITEM_IRON_INGOT : ITEM_COOKED_PORKCHOP;
+        if (!state.input || ![ITEM_RAW_IRON, ITEM_RAW_PORKCHOP, ITEM_RAW_BEEF].includes(state.input.type)) continue;
+        const outputType = state.input.type === ITEM_RAW_IRON ? ITEM_IRON_INGOT :
+            state.input.type === ITEM_RAW_PORKCHOP ? ITEM_COOKED_PORKCHOP : ITEM_STEAK;
         if (state.output && (state.output.type !== outputType || state.output.count >= 64)) continue;
         if (state.fuelRemaining <= 0) {
             if (!state.fuel || state.fuel.type !== ITEM_COAL || state.fuel.count <= 0) continue;
@@ -4463,7 +4626,7 @@ function handleRightClickAction() {
         openChest(target.x, target.y, target.z);
         return;
     }
-    if (hotbar[selectedHotbarSlot]?.type === ITEM_RAW_PORKCHOP) {
+    if ([ITEM_RAW_PORKCHOP, ITEM_COOKED_PORKCHOP, ITEM_RAW_BEEF, ITEM_STEAK].includes(hotbar[selectedHotbarSlot]?.type)) {
         startEatingPorkchop();
         return;
     }
