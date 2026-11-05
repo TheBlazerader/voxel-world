@@ -773,6 +773,8 @@ const WATER_SWIM_UP_SPEED = 3.2;
 const REACH_DISTANCE = 4;
 
 const blocks = new Map();
+const waterLevels = new Map();
+const waterParents = new Map();
 
 const keys = Object.create(null);
 
@@ -1092,7 +1094,9 @@ function handleMultiplayerMessage(message) {
     } else if (message.type === "block_edit") {
         const edit = message.edit;
         if (!isValidRemoteEdit(edit)) return;
-        setBlock(edit.x, edit.y, edit.z, edit.block);
+        setBlock(edit.x, edit.y, edit.z, edit.block, edit.waterLevel, edit.waterParent);
+        if (edit.block === BLOCK_WATER) scheduleWaterUpdate(edit.x, edit.y, edit.z);
+        else spreadWaterFromAdjacentBlocks(edit.x, edit.y, edit.z);
         rebuildAffectedChunks(edit.x, edit.z);
     } else if (message.type === "edit_rejected") {
         multiplayerStatus("A block change was rejected by the server. Rejoining to resync...");
@@ -1112,7 +1116,11 @@ function handleMultiplayerMessage(message) {
                 clearItemDrops();
                 for (const drop of message.itemDrops) addServerItemDrop(drop);
             }
-            for (const edit of message.edits) if (isValidRemoteEdit(edit)) setBlock(edit.x, edit.y, edit.z, edit.block);
+            for (const edit of message.edits) {
+                if (!isValidRemoteEdit(edit)) continue;
+                setBlock(edit.x, edit.y, edit.z, edit.block, edit.waterLevel, edit.waterParent);
+                if (edit.block === BLOCK_WATER) scheduleWaterUpdate(edit.x, edit.y, edit.z);
+            }
             if (Array.isArray(message.pigHealth)) {
                 for (const entry of message.pigHealth) {
                     if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1])) applyPigHit(entry[0], entry[1], false);
@@ -1143,11 +1151,15 @@ function handleMultiplayerMessage(message) {
 }
 
 function isValidRemoteEdit(edit) {
-    return !!edit && Number.isInteger(edit.x) && Number.isInteger(edit.y) && Number.isInteger(edit.z) &&
+    if (!(!!edit && Number.isInteger(edit.x) && Number.isInteger(edit.y) && Number.isInteger(edit.z) &&
         isInsideWorld(edit.x, edit.z) && edit.y >= WORLD_BOTTOM && edit.y <= 40 &&
         [0, BLOCK_GRASS, BLOCK_DIRT, BLOCK_WATER, BLOCK_WOOD, BLOCK_LEAVES, BLOCK_STONE,
             BLOCK_COAL_ORE, BLOCK_IRON_ORE, BLOCK_DIAMOND_ORE, BLOCK_CRAFTING_TABLE, BLOCK_FURNACE, BLOCK_CHEST,
-            ITEM_PLANKS].includes(edit.block);
+            ITEM_PLANKS].includes(edit.block))) return false;
+    if (edit.block === BLOCK_WATER && edit.waterLevel !== undefined &&
+        (!Number.isInteger(edit.waterLevel) || edit.waterLevel < 1 || edit.waterLevel > 8)) return false;
+    if (edit.waterParent != null && (typeof edit.waterParent !== "string" || !/^-?\d+,-?\d+,-?\d+$/.test(edit.waterParent))) return false;
+    return true;
 }
 
 function createRemotePlayer(playerData) {
@@ -1260,8 +1272,8 @@ function sendMultiplayerState(now) {
     multiplayerSend({ type: "player_state", position: { x: player.x, y: player.y, z: player.z }, yaw, crouching });
 }
 
-function sendBlockEdit(x, y, z, block) {
-    if (multiplayerReady) multiplayerSend({ type: "block_edit", x, y, z, block });
+function sendBlockEdit(x, y, z, block, waterLevel = null, waterParent = null) {
+    if (multiplayerReady) multiplayerSend({ type: "block_edit", x, y, z, block, waterLevel, waterParent });
 }
 
 function updateHealthDisplay() {
@@ -1678,13 +1690,28 @@ function getBlock(x, y, z) {
     return blocks.get(blockKey(x, y, z)) || 0;
 }
 
-function setBlock(x, y, z, type) {
+function getWaterLevel(x, y, z) {
+    if (getBlock(x, y, z) !== BLOCK_WATER) return 0;
+    return waterLevels.get(blockKey(x, y, z)) || 8;
+}
+
+function setBlock(x, y, z, type, waterLevel = 8, waterParent = null) {
     const key = blockKey(x, y, z);
 
     if (type === 0) {
         blocks.delete(key);
+        waterLevels.delete(key);
+        waterParents.delete(key);
     } else {
         blocks.set(key, type);
+        if (type === BLOCK_WATER) {
+            waterLevels.set(key, THREE.MathUtils.clamp(Math.round(waterLevel || 8), 1, 8));
+            if (typeof waterParent === "string" && /^-?\d+,-?\d+,-?\d+$/.test(waterParent)) waterParents.set(key, waterParent);
+            else waterParents.delete(key);
+        } else {
+            waterLevels.delete(key);
+            waterParents.delete(key);
+        }
     }
 }
 
@@ -1707,6 +1734,8 @@ function isInsideWorld(x, z) {
 
 function generateWorld() {
     blocks.clear();
+    waterLevels.clear();
+    waterParents.clear();
 
     for (let x = -HALF_WORLD; x < HALF_WORLD; x++) {
         for (let z = -HALF_WORLD; z < HALF_WORLD; z++) {
@@ -2447,6 +2476,19 @@ function addFaceToGeometry(data, x, y, z, face) {
     }
 }
 
+function addWaterFaceToGeometry(data, x, y, z, face, height, neighborHeight) {
+    const order = [0, 1, 2, 0, 2, 3];
+    const isTop = face.normal[1] === 1;
+    const isBottom = face.normal[1] === -1;
+    const sideBase = isTop || isBottom ? 0 : neighborHeight;
+    for (const index of order) {
+        const vertex = face.vertices[index];
+        const localY = isTop ? height : isBottom ? 0 : (vertex[1] === 0 ? sideBase : height);
+        data.positions.push(x + vertex[0], y + localY, z + vertex[2]);
+        data.normals.push(face.normal[0], face.normal[1], face.normal[2]);
+    }
+}
+
 function createChunkMaterialMesh(data, material, type) {
     if (data.positions.length === 0) return null;
 
@@ -2532,22 +2574,29 @@ function rebuildChunkMesh(chunkX, chunkZ) {
                                                                 ? chestData
                                                                 : waterData;
 
-                for (const face of voxelFaces) {
-                    const neighborType = getBlock(
-                        x + face.neighbor[0],
-                        y + face.neighbor[1],
-                        z + face.neighbor[2]
-                    );
-
-                    const faceIsVisible =
-                        neighborType === 0 ||
-                        (
-                            type !== BLOCK_WATER &&
-                            neighborType === BLOCK_WATER
+                if (type === BLOCK_WATER) {
+                    const waterHeight = getWaterLevel(x, y, z) / 8;
+                    for (const face of voxelFaces) {
+                        const nx = x + face.neighbor[0];
+                        const ny = y + face.neighbor[1];
+                        const nz = z + face.neighbor[2];
+                        const neighborType = getBlock(nx, ny, nz);
+                        const neighborHeight = neighborType === BLOCK_WATER ? getWaterLevel(nx, ny, nz) / 8 : 0;
+                        let visible = false;
+                        if (face.normal[1] === 1) visible = neighborType === 0;
+                        else if (face.normal[1] === -1) visible = neighborType === 0;
+                        else visible = neighborType !== BLOCK_WATER || neighborHeight < waterHeight;
+                        if (visible) addWaterFaceToGeometry(data, x, y, z, face, waterHeight, neighborHeight);
+                    }
+                } else {
+                    for (const face of voxelFaces) {
+                        const neighborType = getBlock(
+                            x + face.neighbor[0],
+                            y + face.neighbor[1],
+                            z + face.neighbor[2]
                         );
-
-                    if (faceIsVisible) {
-                        addFaceToGeometry(data, x, y, z, face);
+                        const faceIsVisible = neighborType === 0 || neighborType === BLOCK_WATER;
+                        if (faceIsVisible) addFaceToGeometry(data, x, y, z, face);
                     }
                 }
             }
@@ -3136,7 +3185,7 @@ window.addEventListener("blur", () => {
 // VOXEL TARGETING
 // =====================================================
 
-function getTargetBlock() {
+function getTargetBlock(includeWater = true) {
     camera.updateMatrixWorld(true);
 
     const origin = camera.position;
@@ -3205,7 +3254,7 @@ function getTargetBlock() {
 
         const type = getBlock(x, y, z);
 
-        if (isSolid(type) || type === BLOCK_WATER) {
+        if (isSolid(type) || (includeWater && type === BLOCK_WATER)) {
             return {
                 x,
                 y,
@@ -4314,38 +4363,74 @@ function processNextWaterUpdate() {
     waterUpdatesQueued.delete(sourceKey);
 
     if (getBlock(sourceX, sourceY, sourceZ) === BLOCK_WATER) {
-        // Water spreads horizontally and downward into air, never upward.
-        const spreadOffsets = [
-            [1, 0, 0], [-1, 0, 0],
-            [0, 0, 1], [0, 0, -1], [0, -1, 0]
-        ];
-        const newlySpread = [];
+        let sourceLevel = getWaterLevel(sourceX, sourceY, sourceZ);
+        const parentKey = waterParents.get(sourceKey);
 
-        for (const [dx, dy, dz] of spreadOffsets) {
-            const targetX = sourceX + dx;
-            const targetY = sourceY + dy;
-            const targetZ = sourceZ + dz;
-
-            if (targetY < WORLD_BOTTOM || targetY > 40 || !isInsideWorld(targetX, targetZ)) continue;
-            if (getBlock(targetX, targetY, targetZ) !== 0) continue;
-
-            setBlock(targetX, targetY, targetZ, BLOCK_WATER);
-            sendBlockEdit(targetX, targetY, targetZ, BLOCK_WATER);
-            newlySpread.push([targetX, targetY, targetZ]);
+        // Flowing water remains only while a stronger neighboring water level
+        // supports it. If its original support disappears, another stronger
+        // adjacent flow may take over; otherwise it drains after this delay.
+        if (parentKey) {
+            let supportKey = null;
+            const supportOffsets = [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[0,1,0],[0,-1,0]];
+            for (const [dx, dy, dz] of supportOffsets) {
+                const nx = sourceX + dx, ny = sourceY + dy, nz = sourceZ + dz;
+                if (getBlock(nx, ny, nz) === BLOCK_WATER && getWaterLevel(nx, ny, nz) > sourceLevel) {
+                    supportKey = blockKey(nx, ny, nz);
+                    break;
+                }
+            }
+            if (!supportKey) {
+                setBlock(sourceX, sourceY, sourceZ, 0);
+                sendBlockEdit(sourceX, sourceY, sourceZ, 0);
+                rebuildWaterChunksForPositions([[sourceX, sourceY, sourceZ]]);
+                spreadWaterFromAdjacentBlocks(sourceX, sourceY, sourceZ);
+            } else if (supportKey !== parentKey) {
+                waterParents.set(sourceKey, supportKey);
+            }
         }
 
-        if (newlySpread.length > 0) {
-            rebuildWaterChunksForPositions(newlySpread);
+        if (getBlock(sourceX, sourceY, sourceZ) === BLOCK_WATER) {
+            sourceLevel = getWaterLevel(sourceX, sourceY, sourceZ);
+            if (sourceLevel > 1) {
+                const nextLevel = sourceLevel - 1;
+                const spreadOffsets = [
+                    [1, 0, 0], [-1, 0, 0],
+                    [0, 0, 1], [0, 0, -1], [0, -1, 0]
+                ];
+                const changed = [];
 
-            // Every new water block gets its own delayed update, allowing
-            // the water to continue spreading outward in successive waves.
-            for (const [x, y, z] of newlySpread) {
-                scheduleWaterUpdate(x, y, z);
+                for (const [dx, dy, dz] of spreadOffsets) {
+                    const targetX = sourceX + dx;
+                    const targetY = sourceY + dy;
+                    const targetZ = sourceZ + dz;
+                    if (targetY < WORLD_BOTTOM || targetY > 40 || !isInsideWorld(targetX, targetZ)) continue;
+
+                    // Water levels above 2 cannot flow onto the top of another
+                    // water block. This keeps shallow pools from stacking up.
+                    if (dy === 0 && targetY > WORLD_BOTTOM && getBlock(targetX, targetY - 1, targetZ) === BLOCK_WATER && nextLevel > 2) continue;
+
+                    const targetType = getBlock(targetX, targetY, targetZ);
+                    if (targetType !== 0 && targetType !== BLOCK_WATER) continue;
+
+                    if (targetType === BLOCK_WATER) {
+                        const existingLevel = getWaterLevel(targetX, targetY, targetZ);
+                        // Level-8 blocks are permanent sources; weaker flows
+                        // never replace or flow into them.
+                        if (existingLevel === 8 || nextLevel <= existingLevel) continue;
+                    }
+
+                    const parent = sourceKey;
+                    setBlock(targetX, targetY, targetZ, BLOCK_WATER, nextLevel, parent);
+                    sendBlockEdit(targetX, targetY, targetZ, BLOCK_WATER, nextLevel, parent);
+                    changed.push([targetX, targetY, targetZ]);
+                    scheduleWaterUpdate(targetX, targetY, targetZ);
+                }
+
+                if (changed.length) rebuildWaterChunksForPositions(changed);
             }
         }
     }
 
-    // Process queued water blocks one at a time, with a delay between updates.
     if (waterUpdateQueue.length > 0 && waterUpdateTimer === null) {
         waterUpdateTimer = setTimeout(processNextWaterUpdate, WATER_SPREAD_DELAY);
     }
@@ -4613,8 +4698,8 @@ function useBucket(target) {
             showMessage("There is no room for water there");
             return true;
         }
-        setBlock(x, y, z, BLOCK_WATER);
-        sendBlockEdit(x, y, z, BLOCK_WATER);
+        setBlock(x, y, z, BLOCK_WATER, 8, null);
+        sendBlockEdit(x, y, z, BLOCK_WATER, 8, null);
         scheduleWaterUpdate(x, y, z);
         rebuildAffectedChunks(x, z);
         if (gameMode !== "creative") {
@@ -4666,7 +4751,9 @@ function placeBlock() {
         return;
     }
 
-    const target = getTargetBlock();
+    // Water is transparent for block placement, so the ray continues to the
+    // first solid block behind it just as it would through air.
+    const target = getTargetBlock(false);
 
     if (!target) {
         showMessage("Aim at a block within 4 voxels");
